@@ -88,14 +88,11 @@ async function fetchEventsForArtist(
         return beginDate && beginDate >= today;
       })
       .map((event: MBEvent) => {
-        let venue = "Unknown Venue";
         const relations = event.relations || [];
-        for (const rel of relations) {
-          if (rel.type === "held at" && rel.place) {
-            venue = rel.place.name;
-            break;
-          }
-        }
+        const heldAtRel = relations.find(
+          (rel) => rel.type === "held at" && rel.place
+        );
+        const venue = heldAtRel?.place?.name || "Unknown Venue";
 
         return {
           id: event.id,
@@ -148,27 +145,29 @@ export default function LiveEvents() {
     }
 
     // Step 2: For each artist, fetch upcoming events from MusicBrainz
-    const results: ArtistWithEvents[] = [];
-    for (const artist of artistsWithMbids) {
-      // Sequential to respect MB rate limiting
-      // eslint-disable-next-line no-await-in-loop
-      const artistEvents = await fetchEventsForArtist(
-        artist.artist_mbid,
-        artist.artist_name
-      );
-      artistEvents.listenCount = artist.listen_count;
-      results.push(artistEvents);
-    }
+    // Sequential fetching to respect MB rate limiting (1 req/sec)
+    const results: ArtistWithEvents[] = await artistsWithMbids.reduce(
+      async (
+        accPromise: Promise<ArtistWithEvents[]>,
+        artist: { artist_mbid: string; artist_name: string; listen_count: number }
+      ) => {
+        const acc = await accPromise;
+        const artistEvents = await fetchEventsForArtist(
+          artist.artist_mbid,
+          artist.artist_name
+        );
+        artistEvents.listenCount = artist.listen_count;
+        return [...acc, artistEvents];
+      },
+      Promise.resolve([] as ArtistWithEvents[])
+    );
 
     return results;
   }, [APIService.APIBaseURI, username]);
 
-  const {
-    data: artistsWithEvents,
-    isLoading,
-    isError,
-    error,
-  } = useQuery<ArtistWithEvents[]>({
+  const { data: artistsWithEvents, isLoading, isError, error } = useQuery<
+    ArtistWithEvents[]
+  >({
     queryKey: ["live-events", username],
     queryFn: fetchAllEvents,
     enabled: !!username,
@@ -179,9 +178,7 @@ export default function LiveEvents() {
     if (!artistsWithEvents) return [];
     return artistsWithEvents
       .flatMap((a) => a.events)
-      .sort(
-        (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()
-      );
+      .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
   }, [artistsWithEvents]);
 
   // Get unique event types for filter pills
@@ -239,7 +236,8 @@ export default function LiveEvents() {
 
       {isError && (
         <div className="alert alert-danger" role="alert">
-          {(error as Error)?.message || "An error occurred while fetching events."}
+          {(error as Error)?.message ||
+            "An error occurred while fetching events."}
         </div>
       )}
 
@@ -322,10 +320,7 @@ export default function LiveEvents() {
                       >
                         {artist.artistName}
                       </a>
-                      <small>
-                        {" "}
-                        ({artist.listenCount} listens this month)
-                      </small>
+                      <small> ({artist.listenCount} listens this month)</small>
                     </div>
                     <div className="artist-event-count">
                       {artist.events.length > 0 ? (

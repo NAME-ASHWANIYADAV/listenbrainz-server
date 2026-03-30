@@ -13,8 +13,14 @@ type EventCardProps = {
 };
 
 export default function EventCard(props: EventCardProps) {
-  const { eventName, eventType, eventDate, venue, artistName, eventMbid } =
-    props;
+  const {
+    eventName,
+    eventType,
+    eventDate,
+    venue,
+    artistName,
+    eventMbid,
+  } = props;
 
   const formatDate = (dateStr: string): string => {
     try {
@@ -38,9 +44,7 @@ export default function EventCard(props: EventCardProps) {
         <Pill active type="secondary">
           {eventType || "Event"}
         </Pill>
-        {isUpcoming && (
-          <span className="event-upcoming-badge">Upcoming</span>
-        )}
+        {isUpcoming && <span className="event-upcoming-badge">Upcoming</span>}
       </div>
 
       <div className="event-card-body">
