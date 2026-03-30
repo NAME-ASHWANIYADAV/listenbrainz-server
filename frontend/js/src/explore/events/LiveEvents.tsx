@@ -8,8 +8,6 @@ import Pill from "../../components/Pill";
 import EventCard from "./components/EventCard";
 import { COLOR_LB_ORANGE } from "../../utils/constants";
 
-// Always use production APIs so the POC works without local DB setup
-const LB_API_URL = "https://api.listenbrainz.org";
 const MB_API_URL = "https://musicbrainz.org/ws/2";
 
 type MBEvent = {
@@ -38,18 +36,21 @@ type MBEvent = {
   }>;
 };
 
-type ArtistWithEvents = {
+type ParsedEvent = {
+  id: string;
+  name: string;
+  type: string;
+  date: string;
+  venue: string;
   artistName: string;
-  artistMbid: string;
-  listenCount: number;
-  events: Array<{
-    id: string;
-    name: string;
-    type: string;
-    date: string;
-    venue: string;
-    artistName: string;
-  }>;
+};
+
+type MBArtist = {
+  id: string;
+  name: string;
+  "sort-name": string;
+  disambiguation?: string;
+  country?: string;
 };
 
 // Respect MusicBrainz rate limit: 1 request per second
@@ -65,66 +66,54 @@ async function rateLimitedFetch(url: string): Promise<Response> {
   });
 }
 
-async function fetchEventsForArtist(
-  artistMbid: string,
+function parseUpcomingEvents(
+  events: MBEvent[],
   artistName: string
-): Promise<ArtistWithEvents> {
-  const url = `${MB_API_URL}/event?artist=${artistMbid}&fmt=json&limit=100`;
+): ParsedEvent[] {
+  const today = new Date().toISOString().split("T")[0];
 
-  try {
-    const response = await rateLimitedFetch(url);
-    if (!response.ok) {
-      return { artistName, artistMbid, listenCount: 0, events: [] };
-    }
-
-    const data = await response.json();
-    const events = (data.events || []) as MBEvent[];
-    const today = new Date().toISOString().split("T")[0];
-
-    const upcomingEvents = events
-      .filter((event: MBEvent) => {
-        if (event.cancelled) return false;
-        const beginDate = event["life-span"]?.begin;
-        return beginDate && beginDate >= today;
-      })
-      .map((event: MBEvent) => {
-        const relations = event.relations || [];
-        const heldAtRel = relations.find(
-          (rel) => rel.type === "held at" && rel.place
-        );
-        const venue = heldAtRel?.place?.name || "Unknown Venue";
-
-        return {
-          id: event.id,
-          name: event.name,
-          type: event.type || "Event",
-          date: event["life-span"].begin,
-          venue,
-          artistName,
-        };
-      })
-      .sort(
-        (a: { date: string }, b: { date: string }) =>
-          new Date(a.date).getTime() - new Date(b.date).getTime()
+  return events
+    .filter((event: MBEvent) => {
+      if (event.cancelled) return false;
+      const beginDate = event["life-span"]?.begin;
+      return beginDate && beginDate >= today;
+    })
+    .map((event: MBEvent) => {
+      const relations = event.relations || [];
+      const heldAtRel = relations.find(
+        (rel) => rel.type === "held at" && rel.place
       );
+      const venue = heldAtRel?.place?.name || "Unknown Venue";
 
-    return { artistName, artistMbid, listenCount: 0, events: upcomingEvents };
-  } catch {
-    return { artistName, artistMbid, listenCount: 0, events: [] };
-  }
+      return {
+        id: event.id,
+        name: event.name,
+        type: event.type || "Event",
+        date: event["life-span"].begin,
+        venue,
+        artistName,
+      };
+    })
+    .sort(
+      (a: { date: string }, b: { date: string }) =>
+        new Date(a.date).getTime() - new Date(b.date).getTime()
+    );
 }
 
 export default function LiveEvents() {
   const [filterType, setFilterType] = useState<string>("all");
-  const [searchUser, setSearchUser] = useState<string>("");
-  const [activeUser, setActiveUser] = useState<string>("");
+  const [searchQuery, setSearchQuery] = useState<string>("");
+  const [activeQuery, setActiveQuery] = useState<string>("");
+  const [matchedArtist, setMatchedArtist] = useState<MBArtist | null>(null);
 
   const handleSearch = useCallback(() => {
-    const trimmed = searchUser.trim();
+    const trimmed = searchQuery.trim();
     if (trimmed) {
-      setActiveUser(trimmed);
+      setActiveQuery(trimmed);
+      setMatchedArtist(null);
+      setFilterType("all");
     }
-  }, [searchUser]);
+  }, [searchQuery]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -135,72 +124,55 @@ export default function LiveEvents() {
     [handleSearch]
   );
 
-  const fetchAllEvents = useCallback(async (): Promise<ArtistWithEvents[]> => {
-    if (!activeUser) {
-      throw new Error("Please enter a ListenBrainz username to find events.");
+  const fetchArtistEvents = useCallback(async (): Promise<ParsedEvent[]> => {
+    if (!activeQuery) {
+      throw new Error("Please enter an artist name to search.");
     }
 
-    // Step 1: Fetch user's top artists from production ListenBrainz API
-    const statsUrl = `${LB_API_URL}/1/stats/user/${activeUser}/artists?range=this_month&count=10`;
-    const statsResponse = await fetch(statsUrl);
-    if (!statsResponse.ok) {
+    // Step 1: Search MusicBrainz for the artist
+    const searchUrl = `${MB_API_URL}/artist?query=artist:${encodeURIComponent(
+      activeQuery
+    )}&fmt=json&limit=5`;
+    const searchResponse = await rateLimitedFetch(searchUrl);
+
+    if (!searchResponse.ok) {
+      throw new Error("Failed to search MusicBrainz. Please try again.");
+    }
+
+    const searchData = await searchResponse.json();
+    const artists = (searchData.artists || []) as MBArtist[];
+
+    if (artists.length === 0) {
       throw new Error(
-        `Could not fetch top artists for "${activeUser}". Check the username and try again.`
+        `No artist found matching "${activeQuery}". Try a different name.`
       );
     }
 
-    const statsData = await statsResponse.json();
-    const artists = statsData?.payload?.artists || [];
+    // Use the top match
+    const artist = artists[0];
+    setMatchedArtist(artist);
 
-    // Filter to only artists with MBIDs
-    const artistsWithMbids = artists.filter(
-      (a: { artist_mbid: string | null }) => a.artist_mbid
-    );
+    // Step 2: Fetch events for this artist
+    const eventsUrl = `${MB_API_URL}/event?artist=${artist.id}&fmt=json&limit=100`;
+    const eventsResponse = await rateLimitedFetch(eventsUrl);
 
-    if (artistsWithMbids.length === 0) {
+    if (!eventsResponse.ok) {
       return [];
     }
 
-    // Step 2: For each artist, fetch upcoming events from MusicBrainz
-    // Sequential fetching to respect MB rate limiting (1 req/sec)
-    const results: ArtistWithEvents[] = await artistsWithMbids.reduce(
-      async (
-        accPromise: Promise<ArtistWithEvents[]>,
-        artist: {
-          artist_mbid: string;
-          artist_name: string;
-          listen_count: number;
-        }
-      ) => {
-        const acc = await accPromise;
-        const artistEvents = await fetchEventsForArtist(
-          artist.artist_mbid,
-          artist.artist_name
-        );
-        artistEvents.listenCount = artist.listen_count;
-        return [...acc, artistEvents];
-      },
-      Promise.resolve([] as ArtistWithEvents[])
-    );
+    const eventsData = await eventsResponse.json();
+    const rawEvents = (eventsData.events || []) as MBEvent[];
 
-    return results;
-  }, [activeUser]);
+    return parseUpcomingEvents(rawEvents, artist.name);
+  }, [activeQuery]);
 
-  const { data: artistsWithEvents, isLoading, isError, error } = useQuery<
-    ArtistWithEvents[]
-  >({
-    queryKey: ["live-events", activeUser],
-    queryFn: fetchAllEvents,
-    enabled: !!activeUser,
+  const { data: events, isLoading, isError, error } = useQuery<ParsedEvent[]>({
+    queryKey: ["live-events-artist", activeQuery],
+    queryFn: fetchArtistEvents,
+    enabled: !!activeQuery,
   });
 
-  // Flatten all events for the "all events" view
-  const allEvents = React.useMemo(() => {
-    if (!artistsWithEvents) return [];
-    return artistsWithEvents
-      .flatMap((a) => a.events)
-      .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
-  }, [artistsWithEvents]);
+  const allEvents = events || [];
 
   // Get unique event types for filter pills
   const eventTypes = React.useMemo(() => {
@@ -213,10 +185,6 @@ export default function LiveEvents() {
     return allEvents.filter((e) => e.type === filterType);
   }, [allEvents, filterType]);
 
-  const totalEventsFound = allEvents.length;
-  const artistsWithUpcomingEvents =
-    artistsWithEvents?.filter((a) => a.events.length > 0).length || 0;
-
   return (
     <div role="main">
       <Helmet>
@@ -227,35 +195,45 @@ export default function LiveEvents() {
         <h2 className="header-with-line">
           Live Events
           <span className="header-subtitle">
-            Upcoming concerts for your top artists
+            Discover upcoming concerts &amp; events
           </span>
         </h2>
       </div>
 
-      {/* Username Search */}
+      {/* Artist Search */}
       <div className="events-search" style={{ marginBottom: "2rem" }}>
         <div
           className="input-group"
-          style={{ maxWidth: 500, margin: "0 auto" }}
+          style={{ maxWidth: 550, margin: "0 auto" }}
         >
           <input
             type="text"
             className="form-control"
-            placeholder="Enter a ListenBrainz username..."
-            value={searchUser}
-            onChange={(e) => setSearchUser(e.target.value)}
+            placeholder="Search for an artist (e.g. Radiohead, Coldplay, Taylor Swift)..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
             onKeyDown={handleKeyDown}
-            id="events-username-input"
+            id="events-artist-input"
+            style={{ fontSize: "1rem", padding: "10px 14px" }}
           />
           <span className="input-group-btn">
             <button
               className="btn btn-primary"
               type="button"
               onClick={handleSearch}
-              disabled={!searchUser.trim()}
+              disabled={!searchQuery.trim()}
               id="events-search-btn"
-              style={{ backgroundColor: "#eb743b", borderColor: "#eb743b" }}
+              style={{
+                backgroundColor: "#eb743b",
+                borderColor: "#eb743b",
+                fontSize: "1rem",
+                padding: "10px 20px",
+              }}
             >
+              <span
+                className="glyphicon glyphicon-search"
+                style={{ marginRight: 6 }}
+              />
               Find Events
             </button>
           </span>
@@ -264,8 +242,8 @@ export default function LiveEvents() {
           className="text-center text-muted"
           style={{ marginTop: "0.5rem", fontSize: "0.85rem" }}
         >
-          Enter any ListenBrainz username to discover upcoming events for their
-          top artists.
+          Search any artist to find their upcoming concerts and events from
+          MusicBrainz.
         </p>
       </div>
 
@@ -278,8 +256,8 @@ export default function LiveEvents() {
             width={80}
           />
           <p style={{ marginTop: "1rem", color: "#999" }}>
-            Fetching events from MusicBrainz for <strong>{activeUser}</strong>
-            &apos;s top artists...
+            Searching MusicBrainz for <strong>{activeQuery}</strong>
+            &apos;s upcoming events...
             <br />
             <small>(This may take a few seconds due to rate limiting)</small>
           </p>
@@ -293,27 +271,38 @@ export default function LiveEvents() {
         </div>
       )}
 
-      {!isLoading && !isError && activeUser && artistsWithEvents && (
+      {!isLoading && !isError && activeQuery && events && (
         <>
-          {/* Stats Summary */}
-          <div className="events-summary">
-            <div className="events-stat">
-              <span className="events-stat-number">{totalEventsFound}</span>
-              <span className="events-stat-label">Upcoming Events</span>
+          {/* Artist Info */}
+          {matchedArtist && (
+            <div className="events-summary">
+              <div className="events-stat" style={{ flex: 2 }}>
+                <span
+                  className="events-stat-number"
+                  style={{ fontSize: "1.5rem" }}
+                >
+                  <a
+                    href={`https://musicbrainz.org/artist/${matchedArtist.id}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style={{ color: "#eb743b", textDecoration: "none" }}
+                  >
+                    {matchedArtist.name}
+                  </a>
+                </span>
+                <span className="events-stat-label">
+                  {matchedArtist.disambiguation
+                    ? matchedArtist.disambiguation
+                    : "Artist"}
+                  {matchedArtist.country ? ` · ${matchedArtist.country}` : ""}
+                </span>
+              </div>
+              <div className="events-stat">
+                <span className="events-stat-number">{allEvents.length}</span>
+                <span className="events-stat-label">Upcoming Events</span>
+              </div>
             </div>
-            <div className="events-stat">
-              <span className="events-stat-number">
-                {artistsWithUpcomingEvents}
-              </span>
-              <span className="events-stat-label">Artists with Events</span>
-            </div>
-            <div className="events-stat">
-              <span className="events-stat-number">
-                {artistsWithEvents?.length || 0}
-              </span>
-              <span className="events-stat-label">Artists Checked</span>
-            </div>
-          </div>
+          )}
 
           {/* Filter Pills */}
           {eventTypes.length > 1 && (
@@ -349,45 +338,13 @@ export default function LiveEvents() {
           ) : (
             <div className="text-center" style={{ margin: "3rem 0" }}>
               <p style={{ fontSize: "1.2rem", color: "#666" }}>
-                No upcoming events found for {activeUser}&apos;s top artists
-                this month.
+                No upcoming events found for{" "}
+                <strong>{matchedArtist?.name || activeQuery}</strong>.
               </p>
               <p style={{ color: "#999" }}>
-                Try a different username or time range!
+                This artist may not have any scheduled events in MusicBrainz
+                right now. Try another artist!
               </p>
-            </div>
-          )}
-
-          {/* Per-Artist Breakdown */}
-          {artistsWithEvents && artistsWithEvents.length > 0 && (
-            <div className="events-by-artist">
-              <h3>By Artist</h3>
-              <div className="artist-event-list">
-                {artistsWithEvents.map((artist) => (
-                  <div key={artist.artistMbid} className="artist-event-row">
-                    <div className="artist-event-name">
-                      <a
-                        href={`https://musicbrainz.org/artist/${artist.artistMbid}`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                      >
-                        {artist.artistName}
-                      </a>
-                      <small> ({artist.listenCount} listens this month)</small>
-                    </div>
-                    <div className="artist-event-count">
-                      {artist.events.length > 0 ? (
-                        <Pill active type="secondary">
-                          {artist.events.length} event
-                          {artist.events.length > 1 ? "s" : ""}
-                        </Pill>
-                      ) : (
-                        <span className="text-muted">No upcoming events</span>
-                      )}
-                    </div>
-                  </div>
-                ))}
-              </div>
             </div>
           )}
         </>
