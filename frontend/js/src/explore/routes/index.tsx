@@ -123,6 +123,14 @@ const getExploreRoutes = (): RouteObject[] => {
             },
           },
         },
+        {
+          path: "events/",
+          lazy: {
+            Component: async () => {
+              return (await import("../events/LiveEvents")).default;
+            },
+          },
+        },
       ],
     },
   ];
