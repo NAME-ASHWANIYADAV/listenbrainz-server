@@ -1,15 +1,15 @@
 import * as React from "react";
 import "./LiveEvents.css";
-import { useContext, useState, useCallback } from "react";
+import { useState, useCallback } from "react";
 import Spinner from "react-loader-spinner";
 import { useQuery } from "@tanstack/react-query";
 import { Helmet } from "react-helmet";
-import { toast } from "react-toastify";
-import GlobalAppContext from "../../utils/GlobalAppContext";
 import Pill from "../../components/Pill";
 import EventCard from "./components/EventCard";
 import { COLOR_LB_ORANGE } from "../../utils/constants";
 
+// Always use production APIs so the POC works without local DB setup
+const LB_API_URL = "https://api.listenbrainz.org";
 const MB_API_URL = "https://musicbrainz.org/ws/2";
 
 type MBEvent = {
@@ -115,21 +115,38 @@ async function fetchEventsForArtist(
 }
 
 export default function LiveEvents() {
-  const { APIService, currentUser } = useContext(GlobalAppContext);
   const [filterType, setFilterType] = useState<string>("all");
+  const [searchUser, setSearchUser] = useState<string>("");
+  const [activeUser, setActiveUser] = useState<string>("");
 
-  const username = currentUser?.name;
+  const handleSearch = useCallback(() => {
+    const trimmed = searchUser.trim();
+    if (trimmed) {
+      setActiveUser(trimmed);
+    }
+  }, [searchUser]);
+
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key === "Enter") {
+        handleSearch();
+      }
+    },
+    [handleSearch]
+  );
 
   const fetchAllEvents = useCallback(async (): Promise<ArtistWithEvents[]> => {
-    if (!username) {
-      throw new Error("You must be logged in to see personalized events.");
+    if (!activeUser) {
+      throw new Error("Please enter a ListenBrainz username to find events.");
     }
 
-    // Step 1: Fetch user's top artists from ListenBrainz
-    const statsUrl = `${APIService.APIBaseURI}/stats/user/${username}/artists?range=this_month&count=10`;
+    // Step 1: Fetch user's top artists from production ListenBrainz API
+    const statsUrl = `${LB_API_URL}/1/stats/user/${activeUser}/artists?range=this_month&count=10`;
     const statsResponse = await fetch(statsUrl);
     if (!statsResponse.ok) {
-      throw new Error("Failed to fetch your top artists from ListenBrainz.");
+      throw new Error(
+        `Could not fetch top artists for "${activeUser}". Check the username and try again.`
+      );
     }
 
     const statsData = await statsResponse.json();
@@ -149,7 +166,11 @@ export default function LiveEvents() {
     const results: ArtistWithEvents[] = await artistsWithMbids.reduce(
       async (
         accPromise: Promise<ArtistWithEvents[]>,
-        artist: { artist_mbid: string; artist_name: string; listen_count: number }
+        artist: {
+          artist_mbid: string;
+          artist_name: string;
+          listen_count: number;
+        }
       ) => {
         const acc = await accPromise;
         const artistEvents = await fetchEventsForArtist(
@@ -163,14 +184,14 @@ export default function LiveEvents() {
     );
 
     return results;
-  }, [APIService.APIBaseURI, username]);
+  }, [activeUser]);
 
   const { data: artistsWithEvents, isLoading, isError, error } = useQuery<
     ArtistWithEvents[]
   >({
-    queryKey: ["live-events", username],
+    queryKey: ["live-events", activeUser],
     queryFn: fetchAllEvents,
-    enabled: !!username,
+    enabled: !!activeUser,
   });
 
   // Flatten all events for the "all events" view
@@ -211,12 +232,42 @@ export default function LiveEvents() {
         </h2>
       </div>
 
-      {!username && (
-        <div className="alert alert-info" role="alert">
-          <strong>Log in</strong> to see personalized events based on your
-          listening history.
+      {/* Username Search */}
+      <div className="events-search" style={{ marginBottom: "2rem" }}>
+        <div
+          className="input-group"
+          style={{ maxWidth: 500, margin: "0 auto" }}
+        >
+          <input
+            type="text"
+            className="form-control"
+            placeholder="Enter a ListenBrainz username..."
+            value={searchUser}
+            onChange={(e) => setSearchUser(e.target.value)}
+            onKeyDown={handleKeyDown}
+            id="events-username-input"
+          />
+          <span className="input-group-btn">
+            <button
+              className="btn btn-primary"
+              type="button"
+              onClick={handleSearch}
+              disabled={!searchUser.trim()}
+              id="events-search-btn"
+              style={{ backgroundColor: "#eb743b", borderColor: "#eb743b" }}
+            >
+              Find Events
+            </button>
+          </span>
         </div>
-      )}
+        <p
+          className="text-center text-muted"
+          style={{ marginTop: "0.5rem", fontSize: "0.85rem" }}
+        >
+          Enter any ListenBrainz username to discover upcoming events for their
+          top artists.
+        </p>
+      </div>
 
       {isLoading && (
         <div className="text-center" style={{ margin: "4rem 0" }}>
@@ -227,7 +278,8 @@ export default function LiveEvents() {
             width={80}
           />
           <p style={{ marginTop: "1rem", color: "#999" }}>
-            Fetching events from MusicBrainz for your top artists...
+            Fetching events from MusicBrainz for <strong>{activeUser}</strong>
+            &apos;s top artists...
             <br />
             <small>(This may take a few seconds due to rate limiting)</small>
           </p>
@@ -241,7 +293,7 @@ export default function LiveEvents() {
         </div>
       )}
 
-      {!isLoading && !isError && username && (
+      {!isLoading && !isError && activeUser && artistsWithEvents && (
         <>
           {/* Stats Summary */}
           <div className="events-summary">
@@ -297,10 +349,11 @@ export default function LiveEvents() {
           ) : (
             <div className="text-center" style={{ margin: "3rem 0" }}>
               <p style={{ fontSize: "1.2rem", color: "#666" }}>
-                No upcoming events found for your top artists this month.
+                No upcoming events found for {activeUser}&apos;s top artists
+                this month.
               </p>
               <p style={{ color: "#999" }}>
-                Try listening to more music to expand your artist pool!
+                Try a different username or time range!
               </p>
             </div>
           )}
