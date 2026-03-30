@@ -43,6 +43,7 @@ type ParsedEvent = {
   date: string;
   venue: string;
   artistName: string;
+  isPast: boolean;
 };
 
 type MBArtist = {
@@ -51,6 +52,12 @@ type MBArtist = {
   "sort-name": string;
   disambiguation?: string;
   country?: string;
+};
+
+type FetchResult = {
+  artist: MBArtist;
+  upcomingEvents: ParsedEvent[];
+  pastEvents: ParsedEvent[];
 };
 
 // Respect MusicBrainz rate limit: 1 request per second
@@ -66,51 +73,71 @@ async function rateLimitedFetch(url: string): Promise<Response> {
   });
 }
 
-function parseUpcomingEvents(
-  events: MBEvent[],
-  artistName: string
-): ParsedEvent[] {
+function parseEvents(events: MBEvent[], artistName: string): ParsedEvent[] {
   const today = new Date().toISOString().split("T")[0];
 
   return events
-    .filter((event: MBEvent) => {
-      if (event.cancelled) return false;
-      const beginDate = event["life-span"]?.begin;
-      return beginDate && beginDate >= today;
-    })
+    .filter((event: MBEvent) => !event.cancelled)
     .map((event: MBEvent) => {
       const relations = event.relations || [];
       const heldAtRel = relations.find(
         (rel) => rel.type === "held at" && rel.place
       );
       const venue = heldAtRel?.place?.name || "Unknown Venue";
+      const beginDate = event["life-span"]?.begin || "";
 
       return {
         id: event.id,
         name: event.name,
         type: event.type || "Event",
-        date: event["life-span"].begin,
+        date: beginDate,
         venue,
         artistName,
+        isPast: beginDate < today,
       };
-    })
-    .sort(
-      (a: { date: string }, b: { date: string }) =>
-        new Date(a.date).getTime() - new Date(b.date).getTime()
-    );
+    });
+}
+
+async function fetchAllPages(
+  artistMbid: string,
+  artistName: string
+): Promise<ParsedEvent[]> {
+  const allEvents: ParsedEvent[] = [];
+  let offset = 0;
+  const limit = 100;
+  let totalCount = 1; // will be updated after first fetch
+
+  while (offset < totalCount && offset < 300) {
+    const url = `${MB_API_URL}/event?artist=${artistMbid}&fmt=json&limit=${limit}&offset=${offset}`;
+    try {
+      const response = await rateLimitedFetch(url);
+      if (!response.ok) break;
+
+      const data = await response.json();
+      totalCount = data["event-count"] || 0;
+      const events = (data.events || []) as MBEvent[];
+      if (events.length === 0) break;
+
+      const parsed = parseEvents(events, artistName);
+      allEvents.push(...parsed);
+      offset += limit;
+    } catch {
+      break;
+    }
+  }
+
+  return allEvents;
 }
 
 export default function LiveEvents() {
   const [filterType, setFilterType] = useState<string>("all");
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [activeQuery, setActiveQuery] = useState<string>("");
-  const [matchedArtist, setMatchedArtist] = useState<MBArtist | null>(null);
 
   const handleSearch = useCallback(() => {
     const trimmed = searchQuery.trim();
     if (trimmed) {
       setActiveQuery(trimmed);
-      setMatchedArtist(null);
       setFilterType("all");
     }
   }, [searchQuery]);
@@ -124,7 +151,7 @@ export default function LiveEvents() {
     [handleSearch]
   );
 
-  const fetchArtistEvents = useCallback(async (): Promise<ParsedEvent[]> => {
+  const fetchArtistEvents = useCallback(async (): Promise<FetchResult> => {
     if (!activeQuery) {
       throw new Error("Please enter an artist name to search.");
     }
@@ -148,42 +175,45 @@ export default function LiveEvents() {
       );
     }
 
-    // Use the top match
     const artist = artists[0];
-    setMatchedArtist(artist);
 
-    // Step 2: Fetch events for this artist
-    const eventsUrl = `${MB_API_URL}/event?artist=${artist.id}&fmt=json&limit=100`;
-    const eventsResponse = await rateLimitedFetch(eventsUrl);
+    // Step 2: Fetch ALL events (paginated) for this artist
+    const allEvents = await fetchAllPages(artist.id, artist.name);
 
-    if (!eventsResponse.ok) {
-      return [];
-    }
+    // Step 3: Split into upcoming and past
+    const upcomingEvents = allEvents
+      .filter((e) => !e.isPast)
+      .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
 
-    const eventsData = await eventsResponse.json();
-    const rawEvents = (eventsData.events || []) as MBEvent[];
+    const pastEvents = allEvents
+      .filter((e) => e.isPast)
+      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
-    return parseUpcomingEvents(rawEvents, artist.name);
+    return { artist, upcomingEvents, pastEvents };
   }, [activeQuery]);
 
-  const { data: events, isLoading, isError, error } = useQuery<ParsedEvent[]>({
+  const { data: result, isLoading, isError, error } = useQuery<FetchResult>({
     queryKey: ["live-events-artist", activeQuery],
     queryFn: fetchArtistEvents,
     enabled: !!activeQuery,
   });
 
-  const allEvents = events || [];
+  const showingUpcoming =
+    result && result.upcomingEvents && result.upcomingEvents.length > 0;
+  const displayEvents = showingUpcoming
+    ? result?.upcomingEvents || []
+    : result?.pastEvents || [];
 
   // Get unique event types for filter pills
   const eventTypes = React.useMemo(() => {
-    const types = new Set(allEvents.map((e) => e.type));
+    const types = new Set(displayEvents.map((e) => e.type));
     return ["all", ...Array.from(types)];
-  }, [allEvents]);
+  }, [displayEvents]);
 
   const filteredEvents = React.useMemo(() => {
-    if (filterType === "all") return allEvents;
-    return allEvents.filter((e) => e.type === filterType);
-  }, [allEvents, filterType]);
+    if (filterType === "all") return displayEvents;
+    return displayEvents.filter((e) => e.type === filterType);
+  }, [displayEvents, filterType]);
 
   return (
     <div role="main">
@@ -195,7 +225,7 @@ export default function LiveEvents() {
         <h2 className="header-with-line">
           Live Events
           <span className="header-subtitle">
-            Discover upcoming concerts &amp; events
+            Discover concerts &amp; events for any artist
           </span>
         </h2>
       </div>
@@ -209,7 +239,7 @@ export default function LiveEvents() {
           <input
             type="text"
             className="form-control"
-            placeholder="Search for an artist (e.g. Radiohead, Coldplay, Taylor Swift)..."
+            placeholder="Search for an artist (e.g. Coldplay, Metallica, Ed Sheeran)..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             onKeyDown={handleKeyDown}
@@ -230,10 +260,6 @@ export default function LiveEvents() {
                 padding: "10px 20px",
               }}
             >
-              <span
-                className="glyphicon glyphicon-search"
-                style={{ marginRight: 6 }}
-              />
               Find Events
             </button>
           </span>
@@ -242,8 +268,7 @@ export default function LiveEvents() {
           className="text-center text-muted"
           style={{ marginTop: "0.5rem", fontSize: "0.85rem" }}
         >
-          Search any artist to find their upcoming concerts and events from
-          MusicBrainz.
+          Search any artist to find their concerts and events from MusicBrainz.
         </p>
       </div>
 
@@ -257,9 +282,12 @@ export default function LiveEvents() {
           />
           <p style={{ marginTop: "1rem", color: "#999" }}>
             Searching MusicBrainz for <strong>{activeQuery}</strong>
-            &apos;s upcoming events...
+            &apos;s events...
             <br />
-            <small>(This may take a few seconds due to rate limiting)</small>
+            <small>
+              (Fetching all pages — this may take a few seconds due to rate
+              limiting)
+            </small>
           </p>
         </div>
       )}
@@ -271,38 +299,65 @@ export default function LiveEvents() {
         </div>
       )}
 
-      {!isLoading && !isError && activeQuery && events && (
+      {!isLoading && !isError && result && (
         <>
-          {/* Artist Info */}
-          {matchedArtist && (
-            <div className="events-summary">
-              <div className="events-stat" style={{ flex: 2 }}>
-                <span
-                  className="events-stat-number"
-                  style={{ fontSize: "1.5rem" }}
+          {/* Artist Info + Stats */}
+          <div className="events-summary">
+            <div className="events-stat" style={{ flex: 2 }}>
+              <span
+                className="events-stat-number"
+                style={{ fontSize: "1.5rem" }}
+              >
+                <a
+                  href={`https://musicbrainz.org/artist/${result.artist.id}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{ color: "#eb743b", textDecoration: "none" }}
                 >
-                  <a
-                    href={`https://musicbrainz.org/artist/${matchedArtist.id}`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    style={{ color: "#eb743b", textDecoration: "none" }}
-                  >
-                    {matchedArtist.name}
-                  </a>
-                </span>
-                <span className="events-stat-label">
-                  {matchedArtist.disambiguation
-                    ? matchedArtist.disambiguation
-                    : "Artist"}
-                  {matchedArtist.country ? ` · ${matchedArtist.country}` : ""}
-                </span>
-              </div>
-              <div className="events-stat">
-                <span className="events-stat-number">{allEvents.length}</span>
-                <span className="events-stat-label">Upcoming Events</span>
-              </div>
+                  {result.artist.name}
+                </a>
+              </span>
+              <span className="events-stat-label">
+                {result.artist.disambiguation
+                  ? result.artist.disambiguation
+                  : "Artist"}
+                {result.artist.country ? ` · ${result.artist.country}` : ""}
+              </span>
             </div>
-          )}
+            <div className="events-stat">
+              <span className="events-stat-number">
+                {result.upcomingEvents.length}
+              </span>
+              <span className="events-stat-label">Upcoming</span>
+            </div>
+            <div className="events-stat">
+              <span className="events-stat-number">
+                {result.pastEvents.length}
+              </span>
+              <span className="events-stat-label">Past Events</span>
+            </div>
+          </div>
+
+          {/* Section Header — Upcoming vs Past */}
+          <div
+            style={{
+              textAlign: "center",
+              margin: "1.5rem 0 0.5rem",
+            }}
+          >
+            {showingUpcoming ? (
+              <h3 style={{ color: "#2ecc71" }}>&#127911; Upcoming Events</h3>
+            ) : (
+              <div>
+                <p style={{ color: "#999", marginBottom: "0.25rem" }}>
+                  No upcoming events scheduled right now.
+                </p>
+                <h3 style={{ color: "#eb743b" }}>
+                  &#128197; Recent Past Events
+                </h3>
+              </div>
+            )}
+          </div>
 
           {/* Filter Pills */}
           {eventTypes.length > 1 && (
@@ -323,7 +378,7 @@ export default function LiveEvents() {
           {/* Events Grid */}
           {filteredEvents.length > 0 ? (
             <div className="events-grid">
-              {filteredEvents.map((event) => (
+              {filteredEvents.slice(0, 30).map((event) => (
                 <EventCard
                   key={event.id}
                   eventName={event.name}
@@ -338,14 +393,19 @@ export default function LiveEvents() {
           ) : (
             <div className="text-center" style={{ margin: "3rem 0" }}>
               <p style={{ fontSize: "1.2rem", color: "#666" }}>
-                No upcoming events found for{" "}
-                <strong>{matchedArtist?.name || activeQuery}</strong>.
+                No events found for <strong>{result.artist.name}</strong>.
               </p>
               <p style={{ color: "#999" }}>
-                This artist may not have any scheduled events in MusicBrainz
-                right now. Try another artist!
+                This artist may not have any events in MusicBrainz. Try another
+                artist!
               </p>
             </div>
+          )}
+
+          {filteredEvents.length > 30 && (
+            <p className="text-center text-muted" style={{ marginTop: "1rem" }}>
+              Showing 30 of {filteredEvents.length} events.
+            </p>
           )}
         </>
       )}
