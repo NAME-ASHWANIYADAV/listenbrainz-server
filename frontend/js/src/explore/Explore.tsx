@@ -120,6 +120,13 @@ export default function ExplorePage() {
                 img_name="lb-widgets-beta.jpg"
                 url="https://listenbrainz.readthedocs.io/en/latest/users/widgets.html"
               />
+
+              <ExploreCard
+                name="Live Events (POC)"
+                desc="Discover upcoming concerts for your top artists"
+                img_name="music-neighborhood.jpg"
+                url="/explore/events/"
+              />
             </div>
           </Accordion.Body>
         </Accordion.Item>
